@@ -26,6 +26,7 @@
 #include "bftclient/bft_client.h"
 #include "client/thin-replica-client/thin_replica_client.hpp"
 #include "client/client_pool/concord_client_pool.hpp"
+#include "client/concordclient/client_health.hpp"
 #include "client/concordclient/event_update.hpp"
 #include "client/concordclient/snapshot_update.hpp"
 #include "client/concordclient/concord_client_exceptions.hpp"
@@ -126,6 +127,7 @@ struct ConcordClientConfig {
   // Configuration for subscribe requests
   SubscribeConfig subscribe_config;
   StateSnapshotConfig state_snapshot_config;
+  bool health_check_enabled;
 };
 
 struct StateSnapshotRequest {
@@ -177,6 +179,10 @@ class ConcordClient {
   // Get subscription id.
   std::string getSubscriptionId() const { return config_.subscribe_config.id; }
 
+  // Health of ConcordClient.
+  ClientHealth getClientHealth();
+  void setClientHealth(ClientHealth health);
+
  private:
   config_pool::ConcordClientPoolConfig createClientPoolStruct(const ConcordClientConfig& config);
   void createGrpcConnections();
@@ -190,6 +196,8 @@ class ConcordClient {
   std::atomic_bool active_subscription_{false};
 
   std::vector<std::shared_ptr<::client::concordclient::GrpcConnection>> grpc_connections_;
+
+  bool health_check_enabled_ = false;
   std::unique_ptr<::client::thin_replica_client::ThinReplicaClient> trc_;
   std::unique_ptr<::client::replica_state_snapshot_client::ReplicaStateSnapshotClient> rss_;
   std::unique_ptr<concord::concord_client_pool::ConcordClientPool> client_pool_;

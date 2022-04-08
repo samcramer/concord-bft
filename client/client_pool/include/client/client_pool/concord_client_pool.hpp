@@ -26,6 +26,7 @@
 #include "bftclient/quorums.h"
 #include "client_pool_timer.hpp"
 #include "external_client.hpp"
+#include "client/concordclient/client_health.hpp"
 
 namespace concord {
 namespace external_client {
@@ -153,9 +154,16 @@ class ConcordClientPool {
 
   PoolStatus HealthStatus();
 
+  void setHealthCheckEnabled(bool is_enabled);
+  client::concordclient::ClientHealth getClientHealth();
+  void setClientHealth(concord::client::concordclient::ClientHealth health);
+
   inline bool IsBatchingEnabled() { return client_batching_enabled_; }
 
   bftEngine::OperationResult getClientError();
+
+  void updateRequestCounter();
+  void updateOverloadCounter();
 
  private:
   void setUpClientParams(bftEngine::SimpleClientParams& client_params,
@@ -207,6 +215,12 @@ class ConcordClientPool {
   bftEngine::impl::RollingAvgAndVar average_cid_receive_dur_;
   bftEngine::impl::RollingAvgAndVar average_cid_close_dur_;
   std::unordered_map<std::string, std::chrono::steady_clock::time_point> cid_arrival_map_;
+  // number of requests received while periodically seeing if we're overloaded.
+  bool health_check_enabled_ = false;
+  std::atomic_uint request_counter_ = 0;
+  // number of requests rejected due to being overloaded in current request count period.
+  std::atomic_uint overload_counter_ = 0;
+  std::atomic_bool unhealthy_ = false;
 };
 
 class BatchRequestProcessingJob : public concord::util::SimpleThreadPool::Job {

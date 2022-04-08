@@ -24,13 +24,17 @@
 #include "OpenTracing.hpp"
 #include "concord.cmf.hpp"
 
+#include "client/concordclient/client_health.hpp"
+
 namespace concord::concord_client_pool {
 
 using bftEngine::ClientMsgFlag;
 using namespace bftEngine;
 using namespace bft::communication;
+using namespace concord::client::concordclient;
 
 static inline const std::string kEmptySpanContext = std::string("");
+static inline const uint kNumRequestsPerOverloadCount = 128;
 
 static auto IsGoodForBatching(ClientMsgFlag flags, bool client_batching_enabled) {
   return flags & ClientMsgFlag::PRE_PROCESS_REQ && client_batching_enabled;
@@ -45,6 +49,8 @@ SubmitResult ConcordClientPool::SendRequest(std::vector<uint8_t> &&request,
                                             std::string correlation_id,
                                             const std::string &span_context,
                                             const bftEngine::RequestCallBack &callback) {
+  updateRequestCounter();
+
   if (callback && timeout_ms.count() == 0) {
     callback(bftEngine::SendResult{static_cast<uint32_t>(OperationResult::INVALID_REQUEST)});
     return SubmitResult::Overloaded;
@@ -151,6 +157,7 @@ SubmitResult ConcordClientPool::SendRequest(std::vector<uint8_t> &&request,
   // so client pool will have to reject the request
   ClientPoolMetrics_.rejected_counter++;
   is_overloaded_ = true;
+  updateOverloadCounter();
   LOG_WARN(logger_, "Cannot allocate client for" << KVLOG(correlation_id));
   if (callback) {
     if (serving_candidates == 0 && !clients_.empty()) {
@@ -552,6 +559,33 @@ PoolStatus ConcordClientPool::HealthStatus() {
   return PoolStatus::NotServing;
 }
 
+void ConcordClientPool::setHealthCheckEnabled(bool is_enabled) { health_check_enabled_ = is_enabled; }
+
+ClientHealth ConcordClientPool::getClientHealth() {
+  if (!health_check_enabled_) {
+    return ClientHealth::Healthy;
+  }
+  if (unhealthy_) {
+    return ClientHealth::Unhealthy;
+  } else {
+    return ClientHealth::Healthy;
+  }
+}
+
+void ConcordClientPool::setClientHealth(ClientHealth health) {
+  if (!health_check_enabled_) {
+    return;
+  }
+  LOG_DEBUG(logger_, "ConcordClientPool::setClientHealth(" << health << ")");
+  if (health == ClientHealth::Healthy) {
+    unhealthy_ = false;
+    request_counter_ = 0;
+    overload_counter_ = 0;
+  } else {
+    unhealthy_ = true;
+  }
+}
+
 bool ConcordClientPool::clusterHasKeys(ClientPtr &cl) {
   KeyExchangeMsg msg;
   msg.op = KeyExchangeMsg::HAS_KEYS;
@@ -584,6 +618,39 @@ OperationResult ConcordClientPool::getClientError() {
     }
   }
   return OperationResult::SUCCESS;
+}
+
+void ConcordClientPool::updateOverloadCounter() {
+  if (!health_check_enabled_) {
+    return;
+  }
+  overload_counter_++;
+  if (request_counter_ < kNumRequestsPerOverloadCount) {
+    return;
+  }
+
+  if (overload_counter_ > (request_counter_ / 4)) {
+    // More than 25% of the requests in the checking interval resulted in overload errors;
+    // we're sick.
+    unhealthy_ = true;
+    LOG_ERROR(
+        logger_,
+        "Too many overload errors: " << overload_counter_ << " overloads out of " << request_counter_ << "requests");
+  }
+
+  LOG_DEBUG(logger_, "requests: " << request_counter_ << " overload " << overload_counter_);
+
+  // We've reached the end of our measurement window; start over.
+  request_counter_ = 0;
+  overload_counter_ = 0;
+}
+
+// TODO(scramer): is this trivial method necessary?
+void ConcordClientPool::updateRequestCounter() {
+  if (!health_check_enabled_) {
+    return;
+  }
+  request_counter_++;
 }
 
 }  // namespace concord::concord_client_pool

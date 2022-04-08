@@ -54,10 +54,14 @@ using std::unordered_set;
 using std::vector;
 using std::chrono::steady_clock;
 
+using namespace concord::client::concordclient;
+
 namespace client::thin_replica_client {
 
 const string LogCid::cid_key_ = "cid";
 atomic_bool LogCid::cid_set_ = false;
+
+static inline const uint kNumReadsPerHealthCheck = 128;
 
 LogCid::LogCid(const std::string& cid) {
   bool expected_cid_set_state_ = false;
@@ -111,14 +115,17 @@ bool ThinReplicaClient::readUpdateHashFromStream(size_t server_index,
   LOG_DEBUG(logger_, "Read hash from " << server_index);
 
   GrpcConnection::Result read_result = config_->trs_conns[server_index]->readHash(&hash);
+  updateReadCounter();
   if (read_result == GrpcConnection::Result::kTimeout) {
     LOG_DEBUG(logger_, "Hash stream " << server_index << " timed out.");
     metrics_.read_timeouts_per_update++;
+    updateReadErrorCounter();
     return false;
   }
   if (read_result == GrpcConnection::Result::kFailure) {
     LOG_DEBUG(logger_, "Hash stream " << server_index << " read failed.");
     metrics_.read_failures_per_update++;
+    updateReadErrorCounter();
     return false;
   }
   if (read_result == GrpcConnection::Result::kOutOfRange) {
@@ -206,14 +213,18 @@ std::pair<GrpcConnection::Result, ThinReplicaClient::SpanPtr> ThinReplicaClient:
   }
 
   GrpcConnection::Result read_result = config_->trs_conns[data_conn_index_]->readData(&update_in);
+  updateReadCounter();
+
   if (read_result == GrpcConnection::Result::kTimeout) {
     LOG_DEBUG(logger_, "Data stream " << data_conn_index_ << " timed out");
     metrics_.read_timeouts_per_update++;
+    updateReadErrorCounter();
     return {read_result, nullptr};
   }
   if (read_result == GrpcConnection::Result::kFailure) {
     LOG_DEBUG(logger_, "Data stream " << data_conn_index_ << " read failed");
     metrics_.read_failures_per_update++;
+    updateReadErrorCounter();
     return {read_result, nullptr};
   }
   if (read_result == GrpcConnection::Result::kOutOfRange) {
@@ -317,6 +328,9 @@ void ThinReplicaClient::findBlockHashAgreement(std::vector<bool>& servers_tried,
       LOG_DEBUG(logger_, "Additionally asking " << server_index);
       GrpcConnection::Result stream_open_status = startHashStreamWith(server_index);
 
+      // XXX(scramer): a stream open is kind of like a read.
+      updateReadCounter();
+
       // Assert the possible GrpcConnection::Result values have not changed
       // without updating the following code.
       ConcordAssert(stream_open_status == GrpcConnection::Result::kSuccess ||
@@ -328,10 +342,12 @@ void ThinReplicaClient::findBlockHashAgreement(std::vector<bool>& servers_tried,
       if (stream_open_status == GrpcConnection::Result::kTimeout) {
         LOG_DEBUG(logger_, "Opening a hash stream to server " << server_index << " timed out.");
         metrics_.read_timeouts_per_update++;
+        updateReadErrorCounter();
       }
       if (stream_open_status == GrpcConnection::Result::kFailure) {
         LOG_DEBUG(logger_, "Opening a hash stream to server " << server_index << " failed.");
         metrics_.read_failures_per_update++;
+        updateReadErrorCounter();
       }
       if (stream_open_status == GrpcConnection::Result::kOutOfRange) {
         LOG_DEBUG(logger_, "Opening a hash stream to server " << server_index << " failed, request out of range.");
@@ -410,13 +426,23 @@ bool ThinReplicaClient::rotateDataStreamAndVerify(Data& update_in,
     GrpcConnection::Result open_stream_result = resetDataStreamTo(server_index);
 
     GrpcConnection::Result read_result = GrpcConnection::Result::kUnknown;
+
+    updateReadCounter();
+
     if (open_stream_result == GrpcConnection::Result::kSuccess) {
       read_result = config_->trs_conns[data_conn_index_]->readData(&update_in);
+      updateReadCounter();
     }
     if (open_stream_result == GrpcConnection::Result::kTimeout || read_result == GrpcConnection::Result::kTimeout) {
       LOG_DEBUG(logger_, "Read timed out on a data subscription stream (to server index " << server_index << ").");
       metrics_.read_timeouts_per_update++;
+      updateReadErrorCounter();
       continue;
+    }
+    if ((open_stream_result == GrpcConnection::Result::kFailure) || (read_result == GrpcConnection::Result::kFailure)) {
+      // For health determination purposes we count failures but not "out of range" or
+      // "not found" errors, which are errors which result from caller misbehavior.
+      updateReadErrorCounter();
     }
     if ((open_stream_result == GrpcConnection::Result::kFailure) || (read_result == GrpcConnection::Result::kFailure) ||
         (read_result == GrpcConnection::Result::kOutOfRange) || (read_result == GrpcConnection::Result::kNotFound)) {
@@ -479,10 +505,12 @@ void ThinReplicaClient::logDataStreamResetResult(const GrpcConnection::Result& r
   if (result == GrpcConnection::Result::kTimeout) {
     LOG_DEBUG(logger_, "Opening a data stream to server " << server_index << " timed out.");
     metrics_.read_timeouts_per_update++;
+    updateReadErrorCounter();
   }
   if (result == GrpcConnection::Result::kFailure) {
     LOG_DEBUG(logger_, "Opening a data stream to server " << server_index << " failed.");
     metrics_.read_failures_per_update++;
+    updateReadErrorCounter();
   }
   if (result == GrpcConnection::Result::kOutOfRange) {
     LOG_DEBUG(logger_, "Opening a data stream to server " << server_index << " failed, request out of range.");
@@ -578,6 +606,7 @@ void ThinReplicaClient::receiveUpdates() {
       if (servers_with_hash >= (2 * config_->max_faulty + 1) && !hash_has_agreement) {
         std::string msg{"Internal Error: Couldn't find agreement, 2f+1 replicas generated mismatching hashes"};
         LOG_ERROR(logger_, msg);
+        updateReadErrorCounter();
         throw InternalError();
       }
       // print the warning every minute to avoid flooding with logs
@@ -778,6 +807,7 @@ void ThinReplicaClient::Subscribe() {
     }
     subscription_thread_.reset();
   }
+  has_subscriber_ = true;
   is_event_group_request_ = false;
 
   bool has_verified_state = false;
@@ -1035,6 +1065,8 @@ void ThinReplicaClient::Unsubscribe() {
     subscription_thread_.reset();
   }
 
+  has_subscriber_ = false;
+
   size_t server_to_send_unsubscription_to = 0;
   ConcordAssert(config_->trs_conns.size() > server_to_send_unsubscription_to);
   ConcordAssertNE(config_->trs_conns[server_to_send_unsubscription_to], nullptr);
@@ -1061,12 +1093,80 @@ void ThinReplicaClient::AcknowledgeBlockID(uint64_t block_id) {
 
 // Wrapper for receiveUpdates to forward exceptions
 void ThinReplicaClient::receiveUpdatesWrapper() {
+  has_subscriber_ = true;
+  is_serving_ = true;
   try {
     receiveUpdates();
   } catch (...) {
     // Set exception and quit receiveUpdates
     config_->update_queue->setException(std::current_exception());
     stop_subscription_thread_ = true;
+    has_subscriber_ = false;
+    is_serving_ = false;
+    unhealthy_ = true;
+  }
+}
+
+void ThinReplicaClient::updateReadErrorCounter() {
+  if (!health_check_enabled_) {
+    return;
+  }
+  read_error_counter_for_health_++;
+  if (read_counter_for_health_ < kNumReadsPerHealthCheck) {
+    return;
+  }
+
+  if (read_error_counter_for_health_ > (read_counter_for_health_ / 4)) {
+    // More than 25% of the reads in the checking interval resulted in health errors;
+    // we're sick.
+    unhealthy_ = true;
+    LOG_ERROR(logger_,
+              "Too many read errors: " << read_error_counter_for_health_ << " reads out of " << read_counter_for_health_
+                                       << "reads");
+  }
+
+  LOG_DEBUG(logger_, "reads: " << read_counter_for_health_ << " read errors " << read_error_counter_for_health_);
+
+  // We've reached the end of our measurement window; start over.
+  read_error_counter_for_health_ = 0;
+  read_counter_for_health_ = 0;
+}
+
+// TODO(scramer): is this trivial method necessary?
+void ThinReplicaClient::updateReadCounter() {
+  if (!health_check_enabled_) {
+    return;
+  }
+  read_counter_for_health_++;
+}
+
+void ThinReplicaClient::setHealthCheckEnabled(bool is_enabled) { health_check_enabled_ = is_enabled; }
+
+ClientHealth ThinReplicaClient::getClientHealth() {
+  // If there's no subscriber, we assume that the ThinRepliaClient is healthy.
+  if (!health_check_enabled_) {
+    return ClientHealth::Healthy;
+  }
+  if (!has_subscriber_) {
+    return ClientHealth::Healthy;
+  }
+  if (unhealthy_) {
+    return ClientHealth::Unhealthy;
+  } else {
+    return ClientHealth::Healthy;
+  }
+}
+
+void ThinReplicaClient::setClientHealth(ClientHealth health) {
+  if (!health_check_enabled_) {
+    return;
+  }
+  if (health == ClientHealth::Healthy) {
+    unhealthy_ = false;
+    read_error_counter_for_health_ = 0;
+    read_counter_for_health_ = 0;
+  } else {
+    unhealthy_ = true;
   }
 }
 
