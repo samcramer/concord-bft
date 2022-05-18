@@ -207,18 +207,39 @@ void RequestsBatch::releaseReqsAndSendBatchedReplyIfCompleted(PreProcessReplyMsg
 }
 
 // On a primary replica
+void RequestsBatch::cancelRequestAndBatchIfCompleted(const string &reqBatchCid,
+                                                     uint16_t reqOffsetInBatch,
+                                                     PreProcessingResult status) {
+  const lock_guard<mutex> lock(batchMutex_);
+  if (batchCid_ != reqBatchCid) {
+    LOG_INFO(preProcessor_.logger(),
+             "The batch has been cancelled/completed earlier; do nothing" << KVLOG(clientId_, reqBatchCid, batchCid_));
+    return;
+  }
+  const auto &reqEntry = requestsMap_[reqOffsetInBatch];
+  if (reqEntry) {
+    if (status == CANCEL) preProcessor_.preProcessorMetrics_.preProcConsensusNotReached++;
+    preProcessor_.releaseClientPreProcessRequestSafe(clientId_, reqEntry, status);
+    finalizeBatchIfCompleted();
+  }
+}
+
+// On a primary replica
+void RequestsBatch::finalizeBatchIfCompletedSafe() {
+  const lock_guard<mutex> lock(batchMutex_);
+  finalizeBatchIfCompleted();
+}
+
+// On a primary replica; unsafe
 void RequestsBatch::finalizeBatchIfCompleted() {
   string batchCid;
   atomic_uint32_t batchSize = 0;
   uint32_t numOfCompletedReqs = 0;
-  {
-    const lock_guard<mutex> lock(batchMutex_);
-    if (numOfCompletedReqs_ < batchSize_) return;
-    batchCid = batchCid_;
-    batchSize = batchSize_;
-    numOfCompletedReqs = numOfCompletedReqs_;
-    resetBatchParams();
-  }
+  if (numOfCompletedReqs_ < batchSize_) return;
+  batchCid = batchCid_;
+  batchSize = batchSize_;
+  numOfCompletedReqs = numOfCompletedReqs_;
+  resetBatchParams();
   LOG_INFO(preProcessor_.logger(),
            "The batch has been released" << KVLOG(clientId_, batchCid, numOfCompletedReqs, batchSize));
 }
@@ -342,7 +363,7 @@ PreProcessor::PreProcessor(shared_ptr<MsgsCommunicator> &msgsCommunicator,
                            metricsComponent_.RegisterAtomicGauge("preProcessingTimeAvg", 0),
                            metricsComponent_.RegisterAtomicGauge("launchAsyncPreProcessJobTimeAvg", 0),
                            metricsComponent_.RegisterAtomicGauge("PreProcInFlyRequestsNum", 0)},
-      metric_pre_exe_duration_{metricsComponent_, "metric_pre_exe_duration_", 10000, true},
+      metric_pre_exe_duration_{metricsComponent_, "metric_pre_exe_duration_", 10000, 1000, true},
       totalPreProcessingTime_(true),
       launchAsyncJobTimeAvg_(true),
       preExecReqStatusCheckPeriodMilli_(myReplica_.getReplicaConfig().preExecReqStatusCheckTimerMillisec),
@@ -1287,7 +1308,7 @@ void PreProcessor::handlePreProcessReplyMsg(const string &reqCid,
 
 void PreProcessor::cancelPreProcessing(NodeIdType clientId, const string &batchCid, uint16_t reqOffsetInBatch) {
   if (clientBatchingEnabled_)
-    ongoingReqBatches_[clientId]->cancelBatchAndReleaseRequests(batchCid, CANCEL);
+    ongoingReqBatches_[clientId]->cancelRequestAndBatchIfCompleted(batchCid, reqOffsetInBatch, CANCEL);
   else {
     preProcessorMetrics_.preProcConsensusNotReached++;
     SeqNum reqSeqNum = 0;
@@ -1371,7 +1392,7 @@ void PreProcessor::finalizePreProcessing(NodeIdType clientId, uint16_t reqOffset
                "Pre-processing completed for" << KVLOG(batchCid, reqSeqNum, reqCid, clientId, reqOffsetInBatch));
     }
   }
-  if (batchedPreProcessEnabled_) batchEntry->finalizeBatchIfCompleted();
+  if (batchedPreProcessEnabled_) batchEntry->finalizeBatchIfCompletedSafe();
 }
 
 uint16_t PreProcessor::numOfRequiredReplies() { return myReplica_.getReplicaConfig().fVal + 1; }
@@ -1813,6 +1834,7 @@ void PreProcessor::handleReqPreProcessedByPrimary(const PreProcessRequestMsgShar
                                                   OperationResult preProcessResult) {
   const uint16_t &reqOffsetInBatch = preProcessReqMsg->reqOffsetInBatch();
   concord::diagnostics::TimeRecorder scoped_timer(*histograms_.handlePreProcessedReqByPrimary);
+  setPreprocessingRightNow(clientId, reqOffsetInBatch, false);
   const PreProcessingResult result =
       handlePreProcessedReqByPrimaryAndGetConsensusResult(clientId, reqOffsetInBatch, resultBufLen, preProcessResult);
   if (result != NONE)

@@ -70,7 +70,8 @@ ConcordClientPoolConfig ConcordClient::createClientPoolStruct(const ConcordClien
   }
 
   client_pool_config.participant_nodes.push_back(client_pool_pn);
-  client_pool_config.clients_per_participant_node = config_.num_of_used_bft_clients;
+  client_pool_config.clients_per_participant_node = config_.clients_per_participant_node;
+  client_pool_config.active_clients_in_pool = config_.active_clients_in_pool;
 
   client_pool_config.f_val = config.topology.f_val;
   client_pool_config.c_val = config.topology.c_val;
@@ -100,6 +101,7 @@ ConcordClientPoolConfig ConcordClient::createClientPoolStruct(const ConcordClien
                                        ? "Invalid"
                                        : config.transport.comm_type == TransportConfig::TlsTcp ? "tls" : "udp";
   client_pool_config.enable_multiplex_channel = config.transport.enable_multiplex_channel;
+  client_pool_config.use_unified_certificates = config.transport.use_unified_certs;
   client_pool_config.concord_bft_communication_buffer_length = std::to_string(config.transport.buffer_length);
   client_pool_config.tls_certificates_folder_path = config.transport.tls_cert_root_path;
   client_pool_config.tls_cipher_suite_list = config.transport.tls_cipher_suite;
@@ -130,6 +132,8 @@ void ConcordClient::createGrpcConnections() {
     auto grpc_conn = std::make_shared<GrpcConnection>(
         addr, config_.subscribe_config.id, /* TODO */ 3, /* TODO */ 3, config_.state_snapshot_config.timeout_in_sec);
 
+    LOG_INFO(logger_,
+             "Create Grpc Connection" << KVLOG(config_.subscribe_config.use_tls, addr, config_.subscribe_config.id));
     // TODO: Adapt TRC API to support PEM buffers
     auto trsc_config = std::make_unique<GrpcConnectionConfig>(config_.subscribe_config.use_tls,
                                                               config_.subscribe_config.pem_private_key,

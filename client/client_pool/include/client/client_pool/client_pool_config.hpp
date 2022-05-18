@@ -47,6 +47,7 @@ typedef struct ConcordClientPoolConfig {
   std::uint16_t client_samples_per_evaluation = 32;
   std::uint16_t client_samples_until_reset = 1000;
   std::uint16_t clients_per_participant_node = 1;
+  std::uint16_t active_clients_in_pool = 0;
   bool enable_mock_comm = false;
   std::string comm_to_use = "tls";
   std::string concord_bft_communication_buffer_length = "64000";
@@ -61,6 +62,7 @@ typedef struct ConcordClientPoolConfig {
   std::string file_name;
   bool client_batching_enabled = false;
   bool enable_multiplex_channel = false;
+  bool use_unified_certificates = false;
   size_t client_batching_max_messages_nbr = 20;
   std::uint64_t client_batching_flush_timeout_ms = 100;
   bool encrypted_config_enabled = false;

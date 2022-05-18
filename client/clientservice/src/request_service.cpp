@@ -15,12 +15,16 @@
 #include "client/clientservice/request_service.hpp"
 #include "client/concordclient/concord_client.hpp"
 #include "concord_client_request.pb.h"
+#include "client/thin-replica-client/trace_contexts.hpp"
 
+using namespace client::thin_replica_client;
 using namespace vmware::concord::client::concord_client_request::v1;
 
 namespace concord::client::clientservice {
 
 namespace requestservice {
+
+const std::string kClientInstanceId = "client_instance_id";
 
 void RequestServiceCallData::proceed() {
   if (state_ == FINISH) {
@@ -173,10 +177,16 @@ void RequestServiceCallData::sendToConcordClient() {
     this->populateResult(grpc::Status::OK);
   };
 
+  auto tracer = opentracing::Tracer::Global();
+  auto parent_span = TraceContexts::ExtractSpanFromMetadata(*tracer, ctx_);
+
   if (request_.read_only()) {
     bft::client::ReadConfig config;
     config.request = req_config;
-    auto span = opentracing::Tracer::Global()->StartSpan("send_ro", {});
+    auto span = opentracing::Tracer::Global()->StartSpan("send_ro", {opentracing::ChildOf(parent_span.get())});
+    if (span) {
+      span->SetTag(kClientInstanceId, client_->getSubscriptionId());
+    }
     std::ostringstream carrier;
     opentracing::Tracer::Global()->Inject(span->context(), carrier);
     config.request.span_context = carrier.str();
@@ -184,7 +194,10 @@ void RequestServiceCallData::sendToConcordClient() {
   } else {
     bft::client::WriteConfig config;
     config.request = req_config;
-    auto span = opentracing::Tracer::Global()->StartSpan("send", {});
+    auto span = opentracing::Tracer::Global()->StartSpan("send", {opentracing::ChildOf(parent_span.get())});
+    if (span) {
+      span->SetTag(kClientInstanceId, client_->getSubscriptionId());
+    }
     std::ostringstream carrier;
     opentracing::Tracer::Global()->Inject(span->context(), carrier);
     config.request.span_context = carrier.str();

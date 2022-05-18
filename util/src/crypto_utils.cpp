@@ -287,6 +287,8 @@ bool CertificateUtils::verifyCertificate(X509* cert_to_verify,
   std::regex r("OU=\\d*", std::regex_constants::icase);
   std::smatch sm;
   regex_search(subject, sm, r);
+
+  LOG_DEBUG(GL, "Subject from certificate " << subject);
   if (sm.length() <= peerIdPrefixLength) {
     LOG_ERROR(GL, "OU not found or empty: " << subject);
     return false;
@@ -309,9 +311,12 @@ bool CertificateUtils::verifyCertificate(X509* cert_to_verify,
     return false;
   }
   remote_peer_id = remotePeerId;
+  LOG_INFO(GL, "Peer: " << remote_peer_id);
   std::string CN;
   CN.resize(SIZE);
   X509_NAME_get_text_by_NID(X509_get_subject_name(cert_to_verify), NID_commonName, CN.data(), SIZE);
+
+  LOG_INFO(GL, "Field CN: " << CN);
   std::string cert_type = "server";
   if (CN.find("cli") != std::string::npos) cert_type = "client";
   conn_type = cert_type;
